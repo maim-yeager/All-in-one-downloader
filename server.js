@@ -1,114 +1,224 @@
-'use strict';
+require("dotenv").config()
 
-require('dotenv').config();
+const express = require("express")
+const cors = require("cors")
+const rateLimit = require("express-rate-limit")
+const ytdlp = require("youtube-dl-exec")
+const axios = require("axios")
 
-const express = require('express');
-const cors = require('cors');
-const logger = require('./utils/logger');
-const apiRouter = require('./routes/api');
-const {
-  apiKeyAuth,
-  createRateLimiter,
-  requestLogger,
-  errorHandler,
-  notFoundHandler,
-} = require('./middleware/index');
+const detectPlatform = require("./utils/detectPlatform")
+const sortFormats = require("./utils/formatSorter")
+const validateUrl = require("./utils/validateUrl")
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const NODE_ENV = process.env.NODE_ENV || 'development';
+const app = express()
 
-// Trust proxy for Render.com / reverse proxies
-app.set('trust proxy', 1);
+app.use(express.json())
 
-// ── CORS ────────────────────────────────────────────────────────────────────
-const corsAllowed = process.env.CORS_ALLOWED_ORIGINS || '*';
+app.use(cors({
+  origin: "*"
+}))
 
-const corsOptions = {
-  origin: (origin, callback) => {
-    if (corsAllowed === '*' || NODE_ENV === 'development') return callback(null, true);
-    if (!origin) return callback(null, true);
-    if (/^https?:\/\/localhost(:\d+)?$/.test(origin) ||
-        /^https?:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) {
-      return callback(null, true);
+/* ===========================
+   API KEY AUTH
+=========================== */
+
+app.use((req,res,next)=>{
+
+  const key = req.headers["x-api-key"]
+
+  if(!key || key !== process.env.API_KEY){
+    return res.status(401).json({
+      success:false,
+      error:"Invalid API Key"
+    })
+  }
+
+  next()
+
+})
+
+/* ===========================
+   RATE LIMIT
+=========================== */
+
+const limiter = rateLimit({
+  windowMs: process.env.RATE_LIMIT_WINDOW * 60 * 1000,
+  max: process.env.RATE_LIMIT_MAX
+})
+
+app.use(limiter)
+
+/* ===========================
+   EXTRACT MEDIA
+=========================== */
+
+app.post("/api/extract", async (req,res)=>{
+
+  try{
+
+    const { url } = req.body
+
+    if(!url){
+      return res.json({
+        success:false,
+        error:"URL required"
+      })
     }
-    const allowedList = corsAllowed.split(',').map(o => o.trim());
-    if (allowedList.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS: Origin '${origin}' not allowed`));
-  },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-api-key', 'Authorization'],
-  exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining'],
-  optionsSuccessStatus: 200,
-  maxAge: 86400,
-};
 
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+    if(!validateUrl(url)){
+      return res.json({
+        success:false,
+        error:"Invalid URL"
+      })
+    }
 
-// ── Body Parsing ────────────────────────────────────────────────────────────
-app.use(express.json({ limit: '10kb' }));
-app.use(express.urlencoded({ extended: false, limit: '10kb' }));
+    const platform = detectPlatform(url)
 
-// ── Middleware ──────────────────────────────────────────────────────────────
-app.use(requestLogger);
-app.use(createRateLimiter());
+    if(platform === "unknown"){
+      return res.json({
+        success:false,
+        error:"Unsupported platform"
+      })
+    }
 
-// ── Root Info ───────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
+    const info = await ytdlp(url,{
+      dumpSingleJson:true,
+      noWarnings:true,
+      noCallHome:true,
+      preferFreeFormats:true
+    })
+
+    if(info.entries){
+
+      const items = await Promise.all(info.entries.map(async item => {
+
+        const formats = sortFormats(item.formats)
+
+        const bestFormats = formats
+          .filter(f=>f.vcodec !== "none")
+          .slice(0,5)
+          .map(f=>({
+            quality: `${f.height}p`,
+            type:"video",
+            url:f.url
+          }))
+
+        return {
+          title:item.title,
+          thumbnail:item.thumbnail,
+          duration:item.duration,
+          formats:bestFormats
+        }
+
+      }))
+
+      return res.json({
+        success:true,
+        platform,
+        mediaItems:items
+      })
+
+    }
+
+    const formats = sortFormats(info.formats)
+
+    const videoFormats = formats
+      .filter(f => f.vcodec !== "none")
+      .slice(0,5)
+      .map(f=>({
+        quality:`${f.height}p`,
+        type:"video",
+        url:f.url
+      }))
+
+    const audioFormat = formats
+      .find(f=>f.acodec !== "none")
+
+    if(audioFormat){
+      videoFormats.push({
+        quality:"audio",
+        type:"audio",
+        url:audioFormat.url
+      })
+    }
+
+    res.json({
+      success:true,
+      platform,
+      title:info.title,
+      thumbnail:info.thumbnail,
+      duration:info.duration,
+      formats:videoFormats
+    })
+
+  }catch(err){
+
+    console.error(err)
+
+    res.json({
+      success:false,
+      error:"Media extraction failed"
+    })
+
+  }
+
+})
+
+/* ===========================
+   THUMBNAIL
+=========================== */
+
+app.get("/api/thumbnail", async (req,res)=>{
+
+  try{
+
+    const { url } = req.query
+
+    if(!url){
+      return res.json({
+        success:false,
+        error:"URL required"
+      })
+    }
+
+    const info = await ytdlp(url,{
+      dumpSingleJson:true
+    })
+
+    res.json({
+      success:true,
+      thumbnail:info.thumbnail
+    })
+
+  }catch(err){
+
+    res.json({
+      success:false,
+      error:"Thumbnail fetch failed"
+    })
+
+  }
+
+})
+
+/* ===========================
+   HEALTH CHECK
+=========================== */
+
+app.get("/health",(req,res)=>{
+
   res.json({
-    name: 'Universal Media Downloader API',
-    version: '1.0.0',
-    status: 'online',
-    docs: {
-      endpoints: {
-        'POST /api/extract':   'Extract downloadable media links from a URL',
-        'GET  /api/thumbnail': 'Get thumbnail for a media URL (?url=...)',
-        'GET  /api/formats':   'List available formats (?url=...)',
-        'GET  /health':        'Health check (no auth required)',
-      },
-      authentication: 'Include x-api-key header with all /api/* requests',
-      supportedPlatforms: ['YouTube', 'Instagram', 'Facebook', 'TikTok'],
-      example: {
-        curl: `curl -X POST http://localhost:${PORT}/api/extract \\
-  -H "x-api-key: maim12345" \\
-  -H "Content-Type: application/json" \\
-  -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'`,
-      },
-    },
-  });
-});
+    status:"ok"
+  })
 
-// ── API Routes (auth protected) ─────────────────────────────────────────────
-app.use('/api', apiKeyAuth, apiRouter);
+})
 
-// ── Error Handlers ──────────────────────────────────────────────────────────
-app.use(notFoundHandler);
-app.use(errorHandler);
+/* ===========================
+   START SERVER
+=========================== */
 
-// ── Start ───────────────────────────────────────────────────────────────────
-const server = app.listen(PORT, () => {
-  logger.info('╔══════════════════════════════════════════════╗');
-  logger.info(`║  Universal Media Downloader API              ║`);
-  logger.info(`║  http://localhost:${PORT}  [${NODE_ENV}]${''.padEnd(Math.max(0, 14 - NODE_ENV.length))}║`);
-  logger.info('╚══════════════════════════════════════════════╝');
-  logger.info('Platforms: YouTube | Instagram | Facebook | TikTok');
-});
+const PORT = process.env.PORT || 3000
 
-// Graceful shutdown
-const shutdown = (signal) => {
-  logger.info(`${signal} received — shutting down gracefully...`);
-  server.close(() => {
-    logger.info('Server closed.');
-    process.exit(0);
-  });
-};
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
-
-process.on('unhandledRejection', (reason) => {
-  logger.error(`Unhandled Rejection: ${reason}`);
-});
-
-module.exports = app;
+app.listen(PORT,()=>{
+  console.log(`Server running on port ${PORT}`)
+})
