@@ -1,17 +1,20 @@
 FROM node:18-alpine
 
 RUN apk add --no-cache \
-python3 \
-py3-pip \
-ffmpeg
+    ffmpeg \
+    python3 \
+    curl
 
-RUN pip3 install yt-dlp
+# install yt-dlp binary
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+    -o /usr/local/bin/yt-dlp && \
+    chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm install
+RUN npm install --production
 
 COPY . .
 
